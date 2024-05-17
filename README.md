@@ -1,2 +1,2 @@
 # rgbd_create_map
-ORB-SLAMを使用した地図作成
+Point cloud mapping using rgbd camera and orb-slam3
