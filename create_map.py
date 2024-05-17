@@ -49,9 +49,9 @@ def images_callback(color_img, depth_img, camera_pose_stamped, pub, frame_id):
         )
 
         pcd = o3d.geometry.PointCloud.create_from_rgbd_image(rgbd_image, intrinsic)
-        pcd.transform([[0, 0, 1, 0], [1, 0, 0, 0], [0, -1, 0, 0], [0, 0, 0, 1]])
         T = pose_to_matrix(camera_pose_stamped)
         pcd.transform(T)
+　　　   pcd.transform([[0, 0, 1, 0], [1, 0, 0, 0], [0, -1, 0, 0], [0, 0, 0, 1]])
 
         global tottori_map
         tottori_map += pcd
