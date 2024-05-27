@@ -16,25 +16,28 @@ from visualization_msgs.msg import Marker
 tottori_map = o3d.geometry.PointCloud()
 camera_positions = []
 
+import numpy as np
+
 def pose_to_matrix(pose_stamped):
     pose = pose_stamped.pose
     quaternion = [pose.orientation.w, pose.orientation.x, pose.orientation.y, pose.orientation.z]
     translation = [pose.position.x, pose.position.y, pose.position.z]
-    
-    # 回転行列を取得
-    rotation = o3d.geometry.get_rotation_matrix_from_quaternion(quaternion)
-    
+
+    # クォータニオンから回転行列を計算
+    w, x, y, z = quaternion
+    rotation = np.array([
+        [1 - 2*(y**2 + z**2), 2*(x*y - z*w), 2*(x*z + y*w)],
+        [2*(x*y + z*w), 1 - 2*(x**2 + z**2), 2*(y*z - x*w)],
+        [2*(x*z - y*w), 2*(y*z + x*w), 1 - 2*(x**2 + y**2)]
+    ])
+
     # 4x4の単位行列を作成
     T = np.eye(4)
     T[:3, :3] = rotation
     T[:3, 3] = translation
-    
+
     return T
 
-def apply_transform(point, transform_matrix):
-    point_homogeneous = np.array([point[0], point[1], point[2], 1.0])
-    transformed_point = transform_matrix @ point_homogeneous
-    return transformed_point[:3]
 
 def create_marker(points, frame_id):
     marker = Marker()
@@ -50,9 +53,9 @@ def create_marker(points, frame_id):
 
     for point in points:
         p = Point()
-        p.x = point[0]
-        p.y = point[1]
-        p.z = point[2]
+        p.x = point[2]
+        p.y = -point[0]
+        p.z = point[1]
         marker.points.append(p)
     
     return marker
@@ -81,19 +84,26 @@ def images_callback(color_img, depth_img, camera_pose_stamped, pub, marker_pub, 
         )
 
         pcd = o3d.geometry.PointCloud.create_from_rgbd_image(rgbd_image, intrinsic)
-        T = pose_to_matrix(camera_pose_stamped)
-        pcd.transform(T)
-
-        # OpenCVの左手系からROSの右手系への変換
         pcd.transform([[1, 0, 0, 0], 
                        [0, -1, 0, 0], 
                        [0, 0, -1, 0], 
                        [0, 0, 0, 1]])
+        T = pose_to_matrix(camera_pose_stamped)
+        pcd.transform(T)
+        # 元の変換行列を適用
+        pcd.transform([[1, 0, 0, 0], 
+               [0, 0, -1, 0], 
+               [0, 1, 0, 0], 
+               [0, 0, 0, 1]])
+        pcd.transform([[0, 1, 0, 0], 
+               [-1, 0, 0, 0], 
+               [0, 0, 1, 0], 
+               [0, 0, 0, 1]])     
 
         global tottori_map
         global camera_positions
         tottori_map += pcd
-
+        
         camera_positions.append([camera_pose_stamped.pose.position.x,
                                  camera_pose_stamped.pose.position.y,
                                  camera_pose_stamped.pose.position.z])
