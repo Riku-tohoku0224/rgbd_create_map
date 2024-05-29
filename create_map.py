@@ -14,6 +14,10 @@ import cv2
 from visualization_msgs.msg import Marker
 
 tottori_map = o3d.geometry.PointCloud()
+tottori_map.transform([[0, -1, 0, 0], 
+                       [0, 0, -1, 0], 
+                       [1, 0, 0, 0], 
+                       [0, 0, 0, 1]])
 camera_positions = []
 
 import numpy as np
@@ -26,11 +30,10 @@ def pose_to_matrix(pose_stamped):
     # クォータニオンから回転行列を計算
     w, x, y, z = quaternion
     rotation = np.array([
-        [1 - 2*(y**2 + z**2), 2*(x*y - z*w), 2*(x*z + y*w)],
-        [2*(x*y + z*w), 1 - 2*(x**2 + z**2), 2*(y*z - x*w)],
-        [2*(x*z - y*w), 2*(y*z + x*w), 1 - 2*(x**2 + y**2)]
+        [w**2 + x**2 - y**2 - z**2, 2*(x*y - w*z), 2*(x*z + w*y)],
+        [2*(x*y + w*z), w**2 - x**2 + y**2 - z**2, 2*(y*z - w*x)],
+        [2*(x*z - w*y), 2*(y*z + w*x), w**2 - x**2 - y**2 + z**2]
     ])
-
     # 4x4の単位行列を作成
     T = np.eye(4)
     T[:3, :3] = rotation
@@ -84,24 +87,17 @@ def images_callback(color_img, depth_img, camera_pose_stamped, pub, marker_pub, 
         )
 
         pcd = o3d.geometry.PointCloud.create_from_rgbd_image(rgbd_image, intrinsic)
-        pcd.transform([[1, 0, 0, 0], 
-                       [0, -1, 0, 0], 
+        pcd.transform([[0, -1, 0, 0], 
                        [0, 0, -1, 0], 
+                       [1, 0, 0, 0], 
                        [0, 0, 0, 1]])
         T = pose_to_matrix(camera_pose_stamped)
         pcd.transform(T)
-        # 元の変換行列を適用
-        pcd.transform([[1, 0, 0, 0], 
-               [0, 0, -1, 0], 
-               [0, 1, 0, 0], 
-               [0, 0, 0, 1]])
-        pcd.transform([[0, 1, 0, 0], 
-               [-1, 0, 0, 0], 
-               [0, 0, 1, 0], 
-               [0, 0, 0, 1]])     
+
 
         global tottori_map
         global camera_positions
+
         tottori_map += pcd
         
         camera_positions.append([camera_pose_stamped.pose.position.x,
