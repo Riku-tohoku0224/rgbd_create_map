@@ -4,7 +4,7 @@ import rospy
 import ros_numpy
 import message_filters
 from sensor_msgs.msg import Image, PointCloud2
-from geometry_msgs.msg import PoseStamped, Point  
+from geometry_msgs.msg import PoseStamped, Point
 import sensor_msgs.point_cloud2 as pc2
 from cv_bridge import CvBridge
 import open3d as o3d
@@ -12,35 +12,49 @@ import numpy as np
 from std_msgs.msg import Header, ColorRGBA
 import cv2
 from visualization_msgs.msg import Marker
+from scipy.spatial.transform import Rotation as R
+
+def create_transformation_matrix():
+    angle = np.deg2rad(15)  # 15度をラジアンに変換
+    rotation = R.from_euler('y', angle).as_matrix()
+    
+    T = np.eye(4)
+    T[:3, :3] = rotation
+    
+    return T
+
+def create_transformation_matrix_x_negative_15_degrees():
+    angle = np.deg2rad(-15)  # -15度をラジアンに変換
+    rotation = R.from_euler('x', angle).as_matrix()  # x軸周りの回転行列を生成
+    
+    T = np.eye(4)  # 4x4の単位行列を作成
+    T[:3, :3] = rotation  # 回転行列を適用
+    
+    return T
+
 
 tottori_map = o3d.geometry.PointCloud()
+camera_angle_matrix = create_transformation_matrix()
 tottori_map.transform([[0, -1, 0, 0], 
                        [0, 0, -1, 0], 
                        [1, 0, 0, 0], 
                        [0, 0, 0, 1]])
+tottori_map.transform(camera_angle_matrix)
 camera_positions = []
-
-import numpy as np
+callback_counter = 0
 
 def pose_to_matrix(pose_stamped):
     pose = pose_stamped.pose
-    quaternion = [pose.orientation.w, pose.orientation.x, pose.orientation.y, pose.orientation.z]
+    quaternion = [pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w]
     translation = [pose.position.x, pose.position.y, pose.position.z]
 
-    # クォータニオンから回転行列を計算
-    w, x, y, z = quaternion
-    rotation = np.array([
-        [w**2 + x**2 - y**2 - z**2, 2*(x*y - w*z), 2*(x*z + w*y)],
-        [2*(x*y + w*z), w**2 - x**2 + y**2 - z**2, 2*(y*z - w*x)],
-        [2*(x*z - w*y), 2*(y*z + w*x), w**2 - x**2 - y**2 + z**2]
-    ])
-    # 4x4の単位行列を作成
+    rotation = R.from_quat(quaternion).as_matrix()
+    
     T = np.eye(4)
     T[:3, :3] = rotation
     T[:3, 3] = translation
 
     return T
-
 
 def create_marker(points, frame_id):
     marker = Marker()
@@ -50,20 +64,29 @@ def create_marker(points, frame_id):
     marker.id = 0
     marker.type = Marker.LINE_STRIP
     marker.action = Marker.ADD
-    marker.scale.x = 0.05  # ラインの幅
+    marker.scale.x = 0.05
+    marker.color = ColorRGBA(1.0, 0.0, 0.0, 1.0)
 
-    marker.color = ColorRGBA(1.0, 0.0, 0.0, 1.0)  # 赤色
-
+    # x軸周りに-15度回転する変換行列を適用
+    T = create_transformation_matrix_x_negative_15_degrees()
     for point in points:
-        p = Point()
-        p.x = point[2]
-        p.y = -point[0]
-        p.z = point[1]
-        marker.points.append(p)
+        p = np.array([point[0], point[1], point[2], 1])
+        p_transformed = T @ p  # 変換行列を適用してポイントを回転
+        marker_point = Point()
+        marker_point.x = p_transformed[2]
+        marker_point.y = -p_transformed[0]
+        marker_point.z = -p_transformed[1]
+        marker.points.append(marker_point)
     
     return marker
-
+    
 def images_callback(color_img, depth_img, camera_pose_stamped, pub, marker_pub, frame_id):
+    global callback_counter
+    callback_counter += 1
+
+    if callback_counter % 100 != 0:
+        return
+
     rospy.loginfo("同期した画像とカメラのポーズを受信")
     bridge = CvBridge()
     try:
@@ -79,7 +102,7 @@ def images_callback(color_img, depth_img, camera_pose_stamped, pub, marker_pub, 
         color_raw = o3d.geometry.Image(cv_color_img)
         depth_raw = o3d.geometry.Image(cv_depth_img)
         rgbd_image = o3d.geometry.RGBDImage.create_from_color_and_depth(
-            color_raw, depth_raw, depth_scale=1.0, depth_trunc=5.0, convert_rgb_to_intensity=False
+            color_raw, depth_raw, depth_scale=1.0, depth_trunc=3.0 ,convert_rgb_to_intensity=False
         )
         
         intrinsic = o3d.camera.PinholeCameraIntrinsic(
@@ -87,31 +110,32 @@ def images_callback(color_img, depth_img, camera_pose_stamped, pub, marker_pub, 
         )
 
         pcd = o3d.geometry.PointCloud.create_from_rgbd_image(rgbd_image, intrinsic)
-        pcd.transform([[0, -1, 0, 0], 
-                       [0, 0, -1, 0], 
-                       [1, 0, 0, 0], 
-                       [0, 0, 0, 1]])
+
         T = pose_to_matrix(camera_pose_stamped)
         pcd.transform(T)
-
-
+        pcd.transform([[0, 0, 1, 0], 
+                       [-1, 0, 0, 0], 
+                       [0, -1, 0, 0], 
+                       [0, 0, 0, 1]])
+        pcd.transform(camera_angle_matrix)
         global tottori_map
         global camera_positions
 
         tottori_map += pcd
-        
+
+        voxel_size = 0.01
+        tottori_map = tottori_map.voxel_down_sample(voxel_size)
+
         camera_positions.append([camera_pose_stamped.pose.position.x,
                                  camera_pose_stamped.pose.position.y,
                                  camera_pose_stamped.pose.position.z])
-        marker = create_marker(camera_positions, frame_id)
+        marker = create_marker(camera_positions, frame_id )
         marker_pub.publish(marker)
 
-        voxel_size = 0.1
-        downsampled_tottori_map = tottori_map.voxel_down_sample(voxel_size)
-        rospy.loginfo(f"ボクセルダウンサンプリング後の点群には {len(downsampled_tottori_map.points)} 点")
+        rospy.loginfo(f"ボクセルダウンサンプリング後の点群には {len(tottori_map.points)} 点")
 
-        points = np.asarray(downsampled_tottori_map.points)
-        colors = np.asarray(downsampled_tottori_map.colors) * 255
+        points = np.asarray(tottori_map.points)
+        colors = np.asarray(tottori_map.colors) * 255
         colors = colors.astype(np.uint8)
 
         rgb_colors = np.array([((r << 16) | (g << 8) | b) for b, g, r in colors])
@@ -127,7 +151,7 @@ def images_callback(color_img, depth_img, camera_pose_stamped, pub, marker_pub, 
         rospy.loginfo(f"PointCloud2メッセージを {len(points)} 点で公開")
 
     except Exception as e:
-        rospy.logerr(f"処理に失敗{e}")
+        rospy.logerr(f"処理に失敗: {e}")
 
 def listener():
     rospy.init_node('create_dense_map', anonymous=False)
