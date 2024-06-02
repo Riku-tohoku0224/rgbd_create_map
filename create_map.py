@@ -32,7 +32,6 @@ def create_transformation_matrix_x_negative_15_degrees():
     
     return T
 
-
 tottori_map = o3d.geometry.PointCloud()
 camera_positions = []
 callback_counter = 0
@@ -41,14 +40,9 @@ def pose_to_matrix(pose_stamped):
     pose = pose_stamped.pose
     quaternion = [pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w]
     translation = [pose.position.x, pose.position.y, pose.position.z]
-
     rotation = R.from_quat(quaternion).as_matrix()
-    
-    T = np.eye(4)
-    T[:3, :3] = rotation
-    T[:3, 3] = translation
 
-    return T
+    return rotation, translation
 
 def create_marker(points, frame_id):
     marker = Marker()
@@ -73,7 +67,8 @@ def create_marker(points, frame_id):
         marker.points.append(marker_point)
     
     return marker
-    
+
+
 def images_callback(color_img, depth_img, camera_pose_stamped, pub, marker_pub, frame_id):
     global callback_counter
     callback_counter += 1
@@ -99,34 +94,63 @@ def images_callback(color_img, depth_img, camera_pose_stamped, pub, marker_pub, 
         intrinsic = o3d.camera.PinholeCameraIntrinsic(
             640, 480, 616.5249633789062, 616.7235717773438, 331.1578674316406, 234.31881713867188
         )
-
+        # RGBD画像から点群を生成
         pcd = o3d.geometry.PointCloud.create_from_rgbd_image(rgbd_image, intrinsic)
 
-        T = pose_to_matrix(camera_pose_stamped)
-        #pcd.transform(T)
-        #pcd.transform([[0, 0, 1, 0],
-        #               [-1, 0, 0, 0],
-        #               [0, -1, 0, 0],
-        #               [0, 0, 0, 1]])
-        camera_angle_matrix = create_transformation_matrix()
+        # (0, 0, 0) に緑色の点を追加
+        green_point = np.array([[0, 0, 0]])
+        green_color = np.array([[0, 1, 0]])  # RGBの緑色
+
+        # 点群に新しい点を追加
+        pcd.points = o3d.utility.Vector3dVector(np.vstack((np.asarray(pcd.points), green_point)))
+        pcd.colors = o3d.utility.Vector3dVector(np.vstack((np.asarray(pcd.colors), green_color)))
+        # 点群をNumpy配列に変換
+        points = np.asarray(pcd.points)
+
+        # open3d系からros系に変換するための行列
+            
+        R1 = np.array([[0, 0, 1],
+                       [-1, 0, 0],
+                       [0, -1, 0]])
+        
+        # R1を点群に適用しopen3d系からros系に変換
+        X_ros = np.dot(R1, points.T).T
+
+        # カメラの姿勢の行列を取得
+        T_rotation, T_translation = pose_to_matrix(camera_pose_stamped)
+        # 座標変換の実行
+        X_ros_transformed = (np.dot(T_rotation, X_ros.T).T + T_translation)    
+        # ros系からopen3d系に戻す
+        X_cv_transformed = np.dot(R1.T, X_ros_transformed.T).T 
+
+        # 変換された点群をOpen3Dの点群オブジェクトに変換
+        pcd.points = o3d.utility.Vector3dVector(X_ros_transformed)
+
         #pcd.transform(camera_angle_matrix)
+
         global tottori_map
         global camera_positions
 
+        # tottori_mapに点群を追加
         tottori_map += pcd
 
+        # ボクセルダウンサンプリング
         voxel_size = 0.05
         tottori_map = tottori_map.voxel_down_sample(voxel_size)
+        pcd = pcd.voxel_down_sample(voxel_size)
 
+        # カメラ位置を追加
         camera_positions.append([camera_pose_stamped.pose.position.x,
                                  camera_pose_stamped.pose.position.y,
                                  camera_pose_stamped.pose.position.z])
         marker = create_marker(camera_positions, frame_id)
         marker_pub.publish(marker)
 
+        # ログ出力
         rospy.loginfo(f"ボクセルダウンサンプリング後の点群には {len(tottori_map.points)} 点")
 
-        if callback_counter % 100 == 0:
+        # 100回ごとにPointCloud2メッセージをpublish
+        if callback_counter % 20 == 0:
             points = np.asarray(tottori_map.points)
             colors = np.asarray(tottori_map.colors) * 255
             colors = colors.astype(np.uint8)
