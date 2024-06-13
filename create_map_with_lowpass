@@ -13,7 +13,15 @@ from std_msgs.msg import Header, ColorRGBA
 import cv2
 from visualization_msgs.msg import Marker
 from scipy.spatial.transform import Rotation as R
+import matplotlib
+matplotlib.use('Agg')  # GUIバックエンドを無効化
 import matplotlib.pyplot as plt
+import os
+
+
+tottori_map = o3d.geometry.PointCloud()
+camera_positions = []
+callback_counter = 0
 
 def create_transformation_matrix():
     angle = np.deg2rad(15)  # Convert 15 degrees to radians
@@ -33,10 +41,6 @@ def create_transformation_matrix_x_negative_15_degrees():
     
     return T
 
-tottori_map = o3d.geometry.PointCloud()
-camera_positions = []
-callback_counter = 0
-
 def pose_to_matrix(pose_stamped):
     pose = pose_stamped.pose
     quaternion = [pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w]
@@ -45,7 +49,7 @@ def pose_to_matrix(pose_stamped):
 
     return rotation, translation
 
-def create_marker(points, frame_id):
+def create_marker(points, frame_id, height_every_frame):
     marker = Marker()
     marker.header.frame_id = frame_id
     marker.header.stamp = rospy.Time.now()
@@ -59,7 +63,7 @@ def create_marker(points, frame_id):
     # Apply transformation matrix for -15 degree rotation around the x-axis
     T = create_transformation_matrix_x_negative_15_degrees()
     for point in points:
-        p = np.array([point[0], point[1], point[2], 1])
+        p = np.array([point[0], point[1], point[2]-height_every_frame, 1])
         p_transformed = T @ p  # Apply the transformation matrix
         marker_point = Point()
         marker_point.x = p_transformed[2]
@@ -69,22 +73,29 @@ def create_marker(points, frame_id):
     
     return marker
 
-def apply_low_pass_filter_to_point_cloud(pcd, resolution=0.03, filter_size=5):
+
+def apply_low_pass_filter_to_point_cloud(pcd, base_height, resolution, filter_size):
     points = np.asarray(pcd.points)
+    colors = np.asarray(pcd.colors)
     x_data, y_data, z_data = points[:, 0], points[:, 1], points[:, 2]
+
+    z_data = z_data - base_height
 
     x_edges = np.arange(x_data.min(), x_data.max() + resolution, resolution)
     y_edges = np.arange(y_data.min(), y_data.max() + resolution, resolution)
 
-    z_grid = np.full((len(x_edges) - 1, len(y_edges) - 1, 2), np.nan)
+    z_grid = np.full((len(x_edges) - 1, len(y_edges) - 1, 5), np.nan)  # Z, R, G, B, presence
     for i in range(len(x_data)):
         x_idx = np.searchsorted(x_edges, x_data[i]) - 1
         y_idx = np.searchsorted(y_edges, y_data[i]) - 1
         if np.isnan(z_grid[x_idx, y_idx, 0]) or abs(z_data[i]) > abs(z_grid[x_idx, y_idx, 0]):
             z_grid[x_idx, y_idx, 0] = z_data[i]
-            z_grid[x_idx, y_idx, 1] = 1
+            z_grid[x_idx, y_idx, 1] = colors[i, 0]
+            z_grid[x_idx, y_idx, 2] = colors[i, 1]
+            z_grid[x_idx, y_idx, 3] = colors[i, 2]
+            z_grid[x_idx, y_idx, 4] = 1
 
-    z_grid[np.isnan(z_grid[:, :, 0]), 1] = 1
+    z_grid[np.isnan(z_grid[:, :, 0]), 4] = 0
 
     rows, cols, _ = z_grid.shape
     f = np.fft.fft2(np.nan_to_num(z_grid[:,:,0]))
@@ -98,7 +109,6 @@ def apply_low_pass_filter_to_point_cloud(pcd, resolution=0.03, filter_size=5):
                 mask[i, j] = 1
 
     fshift_masked = fshift * mask
-
     non_zero_before = np.count_nonzero(fshift)
     non_zero_after = np.count_nonzero(fshift_masked)
 
@@ -114,21 +124,21 @@ def regenerate_point_cloud(fshift_masked, x_edges, y_edges, z_grid):
 
     filtered_z_grid = np.zeros_like(z_grid)
     filtered_z_grid[:,:,0] = img_back
-    filtered_z_grid[:,:,1] = z_grid[:,:,1]
+    filtered_z_grid[:,:,1:] = z_grid[:,:,1:]
 
-    # マスクを使って新しい点群を再生成
-    mask = filtered_z_grid[:,:,1].ravel() == 1
+    mask = filtered_z_grid[:,:,4].ravel() == 1
     x_centers = (x_edges[:-1] + x_edges[1:]) / 2
     y_centers = (y_edges[:-1] + y_edges[1:]) / 2
     x_coords, y_coords = np.meshgrid(x_centers, y_centers, indexing='ij')
 
     new_points = np.vstack((x_coords.ravel()[mask], y_coords.ravel()[mask], filtered_z_grid[:,:,0].ravel()[mask])).T
+    new_colors = np.vstack((filtered_z_grid[:,:,1].ravel()[mask], filtered_z_grid[:,:,2].ravel()[mask], filtered_z_grid[:,:,3].ravel()[mask])).T
 
     filtered_pcd = o3d.geometry.PointCloud()
     filtered_pcd.points = o3d.utility.Vector3dVector(new_points)
+    filtered_pcd.colors = o3d.utility.Vector3dVector(new_colors)
 
     return filtered_pcd
-
 
 def images_callback(color_img, depth_img, camera_pose_stamped, pub, marker_pub, frame_id):
     global callback_counter
@@ -180,48 +190,56 @@ def images_callback(color_img, depth_img, camera_pose_stamped, pub, marker_pub, 
         camera_angle_matrix = create_transformation_matrix()
         pcd.transform(camera_angle_matrix)
 
+        # フーリエ変換の基準とする点群の重心を計算
+        centroid = np.asarray(pcd.points).mean(axis=0)
+        height_every_frame = centroid[2]  
+        rospy.loginfo(f"Height of the point cloud: {height_every_frame}")
+
         # ローパスフィルタの適用
-        fshift_masked, x_edges, y_edges, z_grid = apply_low_pass_filter_to_point_cloud(pcd, resolution=0.03, filter_size=5)
-        pcd = regenerate_point_cloud(fshift_masked, x_edges, y_edges, z_grid)
-        rospy.loginfo(f"Filtered point cloud shape: {np.asarray(pcd.points).shape}")
+        resolution = 0.05
+        filter_size = 4
+        #fshift_masked, x_edges, y_edges, z_grid = apply_low_pass_filter_to_point_cloud(pcd, height_every_frame ,resolution, filter_size)
+        #pcd = regenerate_point_cloud(fshift_masked, x_edges, y_edges, z_grid)
+        #rospy.loginfo(f"Filtered point cloud shape: {np.asarray(pcd.points).shape}")
+
 
         global tottori_map
         global camera_positions
 
         # tottori_mapに点群を追加
         tottori_map += pcd
-
+        voxel_size = 0.1
+        tottori_map = tottori_map.voxel_down_sample(voxel_size=voxel_size)
         # カメラ位置を追加
         camera_positions.append([camera_pose_stamped.pose.position.x,
                                  camera_pose_stamped.pose.position.y,
                                  camera_pose_stamped.pose.position.z])
-        marker = create_marker(camera_positions, frame_id)
+        marker = create_marker(camera_positions, frame_id, height_every_frame)
         marker_pub.publish(marker)
 
         # ログ出力
         rospy.loginfo(f"ボクセルダウンサンプリング後の点群には {len(tottori_map.points)} 点")
 
-        # 20回ごとにPointCloud2メッセージをpublishし、.pcdファイルとして保存
+        # 100回ごとにPointCloud2メッセージをpublish
         if callback_counter % 20 == 0:
             points = np.asarray(tottori_map.points)
+            colors = np.asarray(tottori_map.colors) * 255
+            colors = colors.astype(np.uint8)
 
-            pc_array = np.zeros(len(points), dtype=[('x', np.float32), ('y', np.float32), ('z', np.float32)])
+            rgb_colors = np.array([((r << 16) | (g << 8) | b) for b, g, r in colors])
+
+            pc_array = np.zeros(len(points), dtype=[('x', np.float32), ('y', np.float32), ('z', np.float32), ('rgb', np.uint32)])
             pc_array['x'] = points[:, 0]
             pc_array['y'] = points[:, 1]
             pc_array['z'] = points[:, 2]
+            pc_array['rgb'] = rgb_colors
 
             pc_msg = ros_numpy.msgify(PointCloud2, pc_array, stamp=header.stamp, frame_id=header.frame_id)
             pub.publish(pc_msg)
             rospy.loginfo(f"PointCloud2メッセージを {len(points)} 点で公開")
 
-            # 点群を .pcd ファイルとして保存
-            # pcd_file_path = f"/home/riku-suzuki/python_tutorial/tottori_map_{callback_counter//20}.pcd"
-            # o3d.io.write_point_cloud(pcd_file_path, tottori_map)
-            # rospy.loginfo(f"点群を {pcd_file_path} に保存")
-
     except Exception as e:
         rospy.logerr(f"処理に失敗: {e}")
-
 
 
 def listener():
