@@ -114,7 +114,7 @@ def images_callback(color_img, depth_img, pub, pose_subscriber, marker_pub ,fram
         cv_depth_img = np.array(cv_depth_img, dtype=np.float32) 
 
         # OpenCVのBGR形式をRGB形式に変換
-        cv_color_img = cv2.cvtColor(cv_color_img, cv2.COLOR_BGR2RGB)
+        #cv_color_img = cv2.cvtColor(cv_color_img, cv2.COLOR_BGR2RGB)
 
         # OpenCVの画像をOpen3Dの画像形式に変換
         color_raw = o3d.geometry.Image(cv_color_img)
@@ -138,9 +138,6 @@ def images_callback(color_img, depth_img, pub, pose_subscriber, marker_pub ,fram
 
         # 点群をNumpy配列に変換
         points = np.asarray(pcd.points)
-       
-        # ros系からopen3d系に戻す
-        #points = np.dot(R1, points.T).T
 
         #IMUとカメラの座標系の違いを補正
         pose = PoseStamped()
@@ -177,7 +174,7 @@ def images_callback(color_img, depth_img, pub, pose_subscriber, marker_pub ,fram
 
         # tottori_mapに点群を追加
         tottori_map += pcd
-        voxel_size = 1
+        voxel_size = 0.01
         tottori_map = tottori_map.voxel_down_sample(voxel_size=voxel_size)
 
                # カメラ位置を追加
@@ -204,7 +201,7 @@ def images_callback(color_img, depth_img, pub, pose_subscriber, marker_pub ,fram
             pc_array['rgb'] = rgb_colors
 
             pc_msg = ros_numpy.msgify(PointCloud2, pc_array, stamp=header.stamp, frame_id=header.frame_id)
-            #pub.publish(pc_msg)
+            pub.publish(pc_msg)
             marker_pub.publish(marker)
             rospy.loginfo(f"PointCloud2メッセージを {len(points)} 点で公開")
 
