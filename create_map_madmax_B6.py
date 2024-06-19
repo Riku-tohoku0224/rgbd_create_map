@@ -15,7 +15,7 @@ from scipy.spatial.transform import Rotation as R
 from bisect import bisect_left
 from visualization_msgs.msg import Marker
 
-tottori_map = o3d.geometry.PointCloud()
+map = o3d.geometry.PointCloud()
 camera_positions = []
 callback_counter = 0
 
@@ -91,6 +91,75 @@ class PoseStampedSubscriber(message_filters.SimpleFilter):
 
     def find_pose(self, target_time):
         return find_closest_pose(self.poses, target_time)
+    
+    
+def apply_low_pass_filter_to_point_cloud(pcd, base_height, resolution, filter_size):
+    points = np.asarray(pcd.points)
+    colors = np.asarray(pcd.colors)
+    x_data, y_data, z_data = points[:, 0], points[:, 1], points[:, 2]
+
+#点群の重心のz座標の値を基準として、点群の高さを調整
+    z_data = z_data - base_height
+
+    x_edges = np.arange(x_data.min(), x_data.max() + resolution, resolution)
+    y_edges = np.arange(y_data.min(), y_data.max() + resolution, resolution)
+
+    z_grid = np.full((len(x_edges) - 1, len(y_edges) - 1, 5), np.nan)  # Z, R, G, B, presence
+    for i in range(len(x_data)):
+        x_idx = np.searchsorted(x_edges, x_data[i]) - 1
+        y_idx = np.searchsorted(y_edges, y_data[i]) - 1
+        if np.isnan(z_grid[x_idx, y_idx, 0]) or abs(z_data[i]) > abs(z_grid[x_idx, y_idx, 0]):
+            z_grid[x_idx, y_idx, 0] = z_data[i]      #intensityとしてz座標を格納
+            z_grid[x_idx, y_idx, 1] = colors[i, 0]
+            z_grid[x_idx, y_idx, 2] = colors[i, 1]
+            z_grid[x_idx, y_idx, 3] = colors[i, 2]
+            z_grid[x_idx, y_idx, 4] = 1              #最初から点群があった場所には1を格納
+
+    z_grid[np.isnan(z_grid[:, :, 0]), 4] = 0         #点群がなかった場所には0を格納
+
+    rows, cols, _ = z_grid.shape
+    f = np.fft.fft2(np.nan_to_num(z_grid[:,:,0]))
+    fshift = np.fft.fftshift(f)
+
+    crow, ccol = int(rows / 2), int(cols / 2)
+    mask = np.zeros((rows, cols), np.uint8)
+    for i in range(rows):
+        for j in range(cols):
+            if (i - crow)**2 + (j - ccol)**2 <= filter_size**2:
+                mask[i, j] = 1
+
+    fshift_masked = fshift * mask
+    non_zero_before = np.count_nonzero(fshift)
+    non_zero_after = np.count_nonzero(fshift_masked)
+
+    print(f"Data size in frequency domain before filtering: {non_zero_before}")
+    print(f"Data size in frequency domain after filtering : {non_zero_after}")
+
+    return fshift_masked, x_edges, y_edges, z_grid
+
+def regenerate_point_cloud(fshift_masked, x_edges, y_edges, z_grid, base_height):
+    f_ishift = np.fft.ifftshift(fshift_masked)
+    img_back = np.fft.ifft2(f_ishift)
+    img_back = np.real(img_back)
+
+    filtered_z_grid = np.zeros_like(z_grid)
+    filtered_z_grid[:,:,0] = img_back
+    filtered_z_grid[:,:,1:] = z_grid[:,:,1:]
+
+    mask = filtered_z_grid[:,:,4].ravel() == 1
+    x_centers = (x_edges[:-1] + x_edges[1:]) / 2
+    y_centers = (y_edges[:-1] + y_edges[1:]) / 2
+    x_coords, y_coords = np.meshgrid(x_centers, y_centers, indexing='ij')
+
+    new_points = np.vstack((x_coords.ravel()[mask], y_coords.ravel()[mask], filtered_z_grid[:,:,0].ravel()[mask] + base_height)).T
+    new_colors = np.vstack((filtered_z_grid[:,:,1].ravel()[mask], filtered_z_grid[:,:,2].ravel()[mask], filtered_z_grid[:,:,3].ravel()[mask])).T
+
+    filtered_pcd = o3d.geometry.PointCloud()
+    filtered_pcd.points = o3d.utility.Vector3dVector(new_points)
+    filtered_pcd.colors = o3d.utility.Vector3dVector(new_colors)
+
+    return filtered_pcd
+
 
 def images_callback(color_img, depth_img, pub, pose_subscriber, marker_pub ,frame_id):
     global callback_counter
@@ -156,41 +225,53 @@ def images_callback(color_img, depth_img, pub, pose_subscriber, marker_pub ,fram
         
         # 最も近いポーズデータを取得
         closest_pose = pose_subscriber.find_pose(color_img.header.stamp)
-        rospy.loginfo(f"Closest PoseStamped: {closest_pose}")
         
-        # カメラの姿勢の行列を取得
+        # グラウンドテュルースの行列を取得
         T_rotation, T_translation = pose_to_matrix(closest_pose)
-        print(closest_pose)
+        # グラウンドトゥルースの姿勢を適用
         points = (np.dot(T_rotation, points.T).T + T_translation)
-       
-
-
-
+        
         # 変換された点群をOpen3Dの点群オブジェクトに変換
-        pcd.points = o3d.utility.Vector3dVector(points)
+        pcd.points = o3d.utility.Vector3dVector(points)        
 
-        global tottori_map
+        # フーリエ変換の基準とする点群の重心を計算
+        centroid = np.asarray(pcd.points).mean(axis=0)
+        height_every_frame = centroid[2]  
+        #rospy.loginfo(f"Height of the point cloud: {height_every_frame}")
+
+        # ローパスフィルタの適用
+        resolution = 0.1
+        filter_size = 3
+        fshift_masked, x_edges, y_edges, z_grid = apply_low_pass_filter_to_point_cloud(pcd, height_every_frame ,resolution, filter_size)
+        pcd = regenerate_point_cloud(fshift_masked, x_edges, y_edges, z_grid , height_every_frame )
+        #rospy.loginfo(f"Filtered point cloud shape: {np.asarray(pcd.points).shape}")
+
+
+        global map
         global camera_positions
 
         # tottori_mapに点群を追加
-        tottori_map += pcd
-        voxel_size = 0.01
-        tottori_map = tottori_map.voxel_down_sample(voxel_size=voxel_size)
+        map += pcd
+        voxel_size = 0.1
+        map = map.voxel_down_sample(voxel_size=voxel_size)
 
                # カメラ位置を追加
         camera_positions.append([closest_pose.pose.position.x,
-                                 closest_pose.pose.position.y - 0.5,
-                                 closest_pose.pose.position.z])
+                                 closest_pose.pose.position.y,
+                                 closest_pose.pose.position.z - height_every_frame ])
         marker = create_marker(camera_positions, frame_id)
         
         # ログ出力
-        rospy.loginfo(f"ボクセルダウンサンプリング後の点群には {len(tottori_map.points)} 点")
+        rospy.loginfo(f"ボクセルダウンサンプリング後の点群には {len(map.points)} 点")
 
         # 10回ごとにPointCloud2メッセージをpublish
-        if callback_counter % 10 == 0:
-            points = np.asarray(tottori_map.points)
-            colors = np.asarray(tottori_map.colors) * 255
+        if callback_counter % 5 == 0:
+            points = np.asarray(map.points)
+            colors = np.asarray(map.colors) * 255
             colors = colors.astype(np.uint8)
+
+            # pointsとcolorsの長さが一致することを確認
+            assert len(points) == len(colors), "pointsとcolorsの長さが一致しません"
 
             rgb_colors = np.array([((r << 16) | (g << 8) | b) for b, g, r in colors])
 
@@ -210,6 +291,7 @@ def images_callback(color_img, depth_img, pub, pose_subscriber, marker_pub ,fram
 
 
 def listener():
+
     rospy.init_node('create_dense_map', anonymous=False)
     pub = rospy.Publisher('/point_cloud', PointCloud2, queue_size=10)
     marker_pub = rospy.Publisher('/camera_trajectory', Marker, queue_size=10)
