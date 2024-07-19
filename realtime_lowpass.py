@@ -19,19 +19,19 @@ import os
 from datetime import datetime
 
 map = o3d.geometry.PointCloud()
-previous_map = o3d.geometry.PointCloud()  # 前の点群データを保持するための変数
 camera_positions = []
 callback_counter = 0
-PointCloud_save_directory = "/home/riku-suzuki/madmax/test/E-2/original_each_frame_with_image"
+frequency_domain_data_list = []
+#PointCloud_save_directory = "/home/riku-suzuki/madmax/test/E-2/original_each_frame_with_image"
 
-data_size_directory = "/home/riku-suzuki/madmax/test/E-2/original_each_frame_with_image"
+#data_size_directory = "/home/riku-suzuki/madmax/test/E-2/original_each_frame_with_image"
 # 現在の日時を取得
 now = datetime.now()
 # 日時を文字列に変換
 timestamp_str = now.strftime("%Y%m%d_%H%M%S")
 
 # ファイル名に日時を含める
-data_size_file = os.path.join(data_size_directory, f"data_size_{timestamp_str}.csv")
+#data_size_file = os.path.join(data_size_directory, f"data_size_{timestamp_str}.csv")
 
 def create_marker(points, frame_id):
     marker = Marker()
@@ -104,8 +104,6 @@ def apply_low_pass_filter_to_point_cloud(pcd, base_height, resolution, filter_si
     colors = np.asarray(pcd.colors)
     x_data, y_data, z_data = points[:, 0], points[:, 1], points[:, 2]
 
-    z_data = z_data 
-
     x_edges = np.arange(x_data.min(), x_data.max() + resolution, resolution)
     y_edges = np.arange(y_data.min(), y_data.max() + resolution, resolution)
 
@@ -136,9 +134,8 @@ def apply_low_pass_filter_to_point_cloud(pcd, base_height, resolution, filter_si
     # フィルタリングが適用される最大の filter_size を計算
     max_distance = np.sqrt(crow**2 + ccol**2)
     max_filter_size = max_distance * resolution * 10  # 周波数空間での距離を空間分解能に換算
-    real_filter_size = (1- filter_size) * max_filter_size
+    real_filter_size = (1 - filter_size) * max_filter_size
     
-
     mask = np.zeros((rows, cols), np.uint8)
     for i in range(rows):
         for j in range(cols):
@@ -147,34 +144,72 @@ def apply_low_pass_filter_to_point_cloud(pcd, base_height, resolution, filter_si
 
     fshift_masked = fshift * mask
 
-    #non_zero_before = np.count_nonzero(fshift)
-    #non_zero_after = np.count_nonzero(fshift_masked)
-    return fshift_masked, x_edges, y_edges, z_grid, valid_grid
+    x_center = x_edges[crow]
+    y_center = y_edges[ccol]
+
+    return fshift_masked, x_edges, y_edges, z_grid, valid_grid, x_center, y_center
 
 
+def extract_position_from_pose(pose_stamped):
+    # PoseStampedから位置情報を抽出
+    position = pose_stamped.pose.position
+    return np.array([position.x, position.y])
 
-def regenerate_point_cloud(fshift_masked, x_edges, y_edges, z_grid, valid_grid):
-    f_ishift = np.fft.ifftshift(fshift_masked)
-    img_back = np.fft.ifft2(f_ishift)
-    img_back = np.real(img_back)
+def find_data_within_radius(closest_pose, peripheral_radius):
+    closest_position = extract_position_from_pose(closest_pose)
+    found_data = []
+    for data in frequency_domain_data_list:
+        fshift_masked_real, fshift_masked_imag, x_edges, y_edges, z_grid, valid_grid, x_center, y_center = data
+        
+        center = np.array([x_center[0], y_center[0]])
+        distance = np.linalg.norm(closest_position - center)
+        
+        if distance <= peripheral_radius:
+            found_data.append(data)
+    
+    return found_data
 
-    filtered_z_grid = np.zeros_like(z_grid)
-    filtered_z_grid[:,:,0] = img_back
-    filtered_z_grid[:,:,1:] = z_grid[:,:,1:]
+def regenerate_point_cloud(closest_pose, peripheral_radius):
+    matching_data = find_data_within_radius(closest_pose, peripheral_radius)
+    
+    if not matching_data:
+        return None  # 条件を満たすデータがない場合はNoneを返す
 
-    mask = valid_grid.ravel()
-    x_centers = (x_edges[:-1] + x_edges[1:]) / 2
-    y_centers = (y_edges[:-1] + y_edges[1:]) / 2
-    x_coords, y_coords = np.meshgrid(x_centers, y_centers, indexing='ij')
+    new_points = []
+    new_colors = []
 
-    new_points = np.vstack((x_coords.ravel()[mask], y_coords.ravel()[mask], filtered_z_grid[:,:,0].ravel()[mask])).T
-    new_colors = np.vstack((filtered_z_grid[:,:,1].ravel()[mask], filtered_z_grid[:,:,2].ravel()[mask], filtered_z_grid[:,:,3].ravel()[mask])).T
+    for data in matching_data:
+        fshift_masked_real, fshift_masked_imag, x_edges, y_edges, z_grid, valid_grid, _, _ = data
+        
+        fshift_masked = fshift_masked_real + 1j * fshift_masked_imag
+        f_ishift = np.fft.ifftshift(fshift_masked)
+        img_back = np.fft.ifft2(f_ishift)
+        img_back = np.real(img_back)
+
+        filtered_z_grid = np.zeros_like(z_grid)
+        filtered_z_grid[:,:,0] = img_back
+        filtered_z_grid[:,:,1:] = z_grid[:,:,1:]
+
+        mask = valid_grid.ravel()
+        x_centers = (x_edges[:-1] + x_edges[1:]) / 2
+        y_centers = (y_edges[:-1] + y_edges[1:]) / 2
+        x_coords, y_coords = np.meshgrid(x_centers, y_centers, indexing='ij')
+
+        points = np.vstack((x_coords.ravel()[mask], y_coords.ravel()[mask], filtered_z_grid[:,:,0].ravel()[mask])).T
+        colors = np.vstack((filtered_z_grid[:,:,1].ravel()[mask], filtered_z_grid[:,:,2].ravel()[mask], filtered_z_grid[:,:,3].ravel()[mask])).T
+        
+        new_points.append(points)
+        new_colors.append(colors)
+    
+    new_points = np.concatenate(new_points, axis=0)
+    new_colors = np.concatenate(new_colors, axis=0)
 
     filtered_pcd = o3d.geometry.PointCloud()
     filtered_pcd.points = o3d.utility.Vector3dVector(new_points)
     filtered_pcd.colors = o3d.utility.Vector3dVector(new_colors)
-
+    
     return filtered_pcd
+
 
 def key_listener():
     global save_flag
@@ -240,27 +275,40 @@ def images_callback(color_img, depth_img, pub, pose_subscriber, marker_pub, fram
         height_every_frame = centroid[2]
 
         resolution = 0.1
-        filter_size = -0.1
-        fshift_masked, x_edges, y_edges, z_grid, valid_grid = apply_low_pass_filter_to_point_cloud(pcd, height_every_frame, resolution, filter_size)
-        pcd = regenerate_point_cloud(fshift_masked, x_edges, y_edges, z_grid, valid_grid)
+        filter_size = 0.3
+        fshift_masked, x_edges, y_edges, z_grid, valid_grid, x_center, y_center= apply_low_pass_filter_to_point_cloud(pcd, height_every_frame, resolution, filter_size)
 
-        #previous_map = map  # 現在のmapをprevious_mapに保存
-        map += pcd
-        voxel_size = 0.1
-        map = map.voxel_down_sample(voxel_size=voxel_size)
+        fshift_masked_real = np.real(fshift_masked)
+        fshift_masked_imag = np.imag(fshift_masked)
+
+        frequency_domain_data = [
+            fshift_masked_real,
+            fshift_masked_imag,
+            x_edges,
+            y_edges,
+            z_grid,
+            valid_grid,
+            np.array([x_center]),
+            np.array([y_center])
+        ]
+        
+        frequency_domain_data_list.append(frequency_domain_data) #周波数領域のデータをリストに追加
+        
+        peripheral_radius = 10 #復元する点群範囲の設定
+        pcd = regenerate_point_cloud(closest_pose ,peripheral_radius)
 
         camera_positions.append([closest_pose.pose.position.x,
                                  closest_pose.pose.position.y,
                                  closest_pose.pose.position.z])
         marker = create_marker(camera_positions, frame_id)
 
-        rospy.loginfo(f"ボクセルダウンサンプリング後の点群には {len(map.points)} 点")
+        rospy.loginfo(f"ボクセルダウンサンプリング後の点群には {len(pcd.points)} 点")
 
 
 
-        if callback_counter % 50 == 0:
-            points = np.asarray(map.points)
-            colors = np.asarray(map.colors) * 255
+        if callback_counter % 1 == 0:
+            points = np.asarray(pcd.points)
+            colors = np.asarray(pcd.colors) * 255
             colors = colors.astype(np.uint8)
 
             assert len(points) == len(colors), "pointsとcolorsの長さが一致しません"
